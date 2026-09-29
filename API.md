@@ -9,16 +9,24 @@ frontend origin CORS allows — set it to wherever your frontend runs, e.g.
 All three entry points hit the same backend, just with a different `entryPoint` string (and
 `productCode` when it's already known):
 
-| Entry point | `entryPoint` value | `productCode` |
-|---|---|---|
-| Sticky widget (every page) | `"sticky_widget"` | omit — not known yet |
-| Product page button | `"product_page"` | the product's code, e.g. `"59405"` — you already know it from the page |
-| Header → Support → Technical Support page | `"technical_support_page"` | omit |
+| Entry point | `entryPoint` value | `productCode` | Can recommend products? |
+|---|---|---|---|
+| Sticky widget (every page) | `"sticky_widget"` | omit — not known yet | Yes |
+| Product page button | `"product_page"` | the product's code, e.g. `"59405"` — you already know it from the page | Yes |
+| Header → Support → Technical Support page | `"technical_support_page"` | omit | No — strictly troubleshooting, will decline/escalate a "help me choose" question here |
 
-`entryPoint` is currently just stored on the session for reference — it doesn't change bot
-behavior yet. If/when you want the three to actually behave differently (e.g. sticky widget
-also recommends a product, technical-support page stays strictly troubleshooting), that's a
-backend change — tell me and I'll add it.
+`entryPoint` **does** change bot behavior: on the sticky widget and product-page, the bot can
+search the product catalog snapshot (see below) and suggest/recommend products, not just
+troubleshoot. On the technical-support page it stays strictly troubleshooting-only by design.
+Any other/unrecognised `entryPoint` value defaults to the strict (no-recommend) behavior.
+
+### Product catalog
+
+The bot can search a snapshot of ~2000 scraped products (name, category, finish, size,
+features — **no price, no live stock**) when recommending. It's told to never state a price
+and to phrase stock as "showed as in stock in our last catalog update, please confirm" rather
+than a live fact. This is separate from the troubleshooting knowledge base and only used on
+the two entry points marked above.
 
 ## 1. Send a message — `POST /chat/message`
 
