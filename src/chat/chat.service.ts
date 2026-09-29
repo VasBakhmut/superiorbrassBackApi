@@ -4,6 +4,7 @@ import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { SupabaseService } from '../supabase/supabase.service.js';
 import { KnowledgeService } from '../knowledge/knowledge.service.js';
 import { SendMessageDto } from './dto/send-message.dto.js';
+import { classifyError } from './chat-error.util.js';
 
 const MODEL = 'gemini-3.6-flash';
 const NO_ANSWER_MARKER = 'NO_ANSWER';
@@ -25,6 +26,12 @@ export type ChatStreamEvent =
   | { type: 'session'; sessionId: string }
   | { type: 'chunk'; text: string }
   | { type: 'done'; needsEscalation: boolean; escalationSummary?: string; message?: string };
+
+const MAX_ATTEMPTS = 3;
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 @Injectable()
 export class ChatService {
@@ -48,40 +55,66 @@ export class ChatService {
     const conversationText = [dto.productCode, ...history.map((m) => m.content)].filter(Boolean).join('\n');
     const context = await this.knowledge.getContextForConversation(conversationText);
 
-    const stream = await this.ai.models.generateContentStream({
-      model: MODEL,
-      contents: history.map((m) => ({
-        role: m.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: m.content }],
-      })),
-      config: {
-        systemInstruction: `${SYSTEM_PROMPT}\n\nContext:\n${context}`,
-        maxOutputTokens: 1024,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-      },
-    });
-
     // Buffer until we know whether the reply starts with the NO_ANSWER marker, so we
     // never flash raw "NO_ANSWER: ..." text at the visitor before falling back.
     let full = '';
     let determined = false;
     let isNoAnswer = false;
+    let chunkEmitted = false;
     const MARKER_PROBE_LEN = NO_ANSWER_MARKER.length + 1;
 
-    for await (const chunk of stream) {
-      const delta = chunk.text ?? '';
-      if (!delta) continue;
-      full += delta;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      full = '';
+      determined = false;
 
-      if (!determined) {
-        if (full.length >= MARKER_PROBE_LEN) {
-          determined = true;
-          isNoAnswer = full.startsWith(NO_ANSWER_MARKER);
-          if (!isNoAnswer) onEvent({ type: 'chunk', text: full });
+      try {
+        const stream = await this.ai.models.generateContentStream({
+          model: MODEL,
+          contents: history.map((m) => ({
+            role: m.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: m.content }],
+          })),
+          config: {
+            systemInstruction: `${SYSTEM_PROMPT}\n\nContext:\n${context}`,
+            maxOutputTokens: 1024,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+          },
+        });
+
+        for await (const chunk of stream) {
+          const delta = chunk.text ?? '';
+          if (!delta) continue;
+          full += delta;
+
+          if (!determined) {
+            if (full.length >= MARKER_PROBE_LEN) {
+              determined = true;
+              isNoAnswer = full.startsWith(NO_ANSWER_MARKER);
+              if (!isNoAnswer) {
+                onEvent({ type: 'chunk', text: full });
+                chunkEmitted = true;
+              }
+            }
+            continue;
+          }
+          if (!isNoAnswer) {
+            onEvent({ type: 'chunk', text: delta });
+            chunkEmitted = true;
+          }
         }
-        continue;
+        break; // this attempt completed successfully
+      } catch (err) {
+        // Gemini overload/rate-limit errors are usually transient ("spikes in demand are
+        // usually temporary" per Google's own message) — silently retry once or twice,
+        // but only while nothing has reached the visitor yet for this turn.
+        const { code } = classifyError(err);
+        const isTransient = code === 'UPSTREAM_ERROR' || code === 'RATE_LIMIT';
+        if (!chunkEmitted && isTransient && attempt < MAX_ATTEMPTS) {
+          await sleep(attempt * 1000);
+          continue;
+        }
+        throw err;
       }
-      if (!isNoAnswer) onEvent({ type: 'chunk', text: delta });
     }
 
     if (!determined) {
