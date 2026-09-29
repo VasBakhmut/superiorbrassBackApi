@@ -1,13 +1,14 @@
-import { IsOptional, IsString, MaxLength } from 'class-validator';
+import { IsOptional, IsString, IsUrl, MaxLength } from 'class-validator';
 
 export class SendMessageDto {
   @IsOptional()
   @IsString()
   sessionId?: string;
 
+  @IsOptional()
   @IsString()
   @MaxLength(2000)
-  message!: string;
+  message?: string;
 
   @IsOptional()
   @IsString()
@@ -16,4 +17,8 @@ export class SendMessageDto {
   @IsOptional()
   @IsString()
   productCode?: string;
+
+  @IsOptional()
+  @IsUrl()
+  imageUrl?: string; // URL returned by POST /chat/upload-image
 }

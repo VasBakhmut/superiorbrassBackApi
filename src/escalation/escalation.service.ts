@@ -8,7 +8,7 @@ export interface EscalationInput {
   customerEmail: string;
   productCode?: string;
   issueSummary: string;
-  transcript: { role: string; content: string }[];
+  transcript: { role: string; content: string; image_url?: string | null }[];
 }
 
 @Injectable()
@@ -48,13 +48,13 @@ export class EscalationService {
     }
 
     const transcriptText = input.transcript
-      .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+      .map((m) => `${m.role.toUpperCase()}: ${m.content}${m.image_url ? `\n  [photo attached: ${m.image_url}]` : ''}`)
       .join('\n');
 
     await this.resend.emails.send({
       from: this.config.getOrThrow<string>('ESCALATION_FROM_EMAIL'),
       to: toEmail,
-      subject: `[Austyle Support Bot] Escalation — ${input.productCode ?? 'unspecified product'}`,
+      subject: `[Support Bot] Escalation — ${input.productCode ?? 'unspecified product'}`,
       text: [
         `Customer email: ${input.customerEmail}`,
         `Product code: ${input.productCode ?? 'not specified'}`,

@@ -1,13 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+import OpenAI from 'openai';
 import { SupabaseService } from '../supabase/supabase.service.js';
 import { KnowledgeService } from '../knowledge/knowledge.service.js';
 import { ProductsService } from '../knowledge/products.service.js';
 import { SendMessageDto } from './dto/send-message.dto.js';
 import { classifyError } from './chat-error.util.js';
 
-const MODEL = 'gemini-3.6-flash';
+const MODEL = 'gpt-4o-mini';
 const NO_ANSWER_MARKER = 'NO_ANSWER';
 const NO_ANSWER_FALLBACK_MESSAGE =
   "Sorry, I don't have a confident answer for that from our documentation. Could you share your email and product model so I can pass this to our support team?";
@@ -23,6 +23,7 @@ function buildSystemPrompt(canRecommend: boolean): string {
 Rules:
 - Answer ONLY using the "Context" provided below (SOPs, installation manuals, troubleshooting guides, and, when relevant, a product catalog snapshot). Never guess, and never use general knowledge about hardware that isn't in the context.
 - Keep answers short, practical, step-by-step where relevant.
+- The customer may attach a photo (of their existing hardware, or of their door). Look at it and use what you can actually see — the product type, finish, visible damage, mounting details — to inform your answer. If you can identify a product code or close match from the image, say so, but don't invent a code you can't actually read or infer with reasonable confidence.
 - The troubleshooting context you're given is scoped to the product model mentioned in this conversation, and is built BEFORE you see the question — so if no model has been mentioned yet, model-specific documentation (e.g. troubleshooting for a specific fault) may simply be missing from your context even though it exists in our systems.`;
 
   const codeRule = canRecommend
@@ -49,7 +50,7 @@ function sleep(ms: number) {
 
 @Injectable()
 export class ChatService {
-  private readonly ai: GoogleGenAI;
+  private readonly ai: OpenAI;
 
   constructor(
     config: ConfigService,
@@ -57,14 +58,15 @@ export class ChatService {
     private readonly knowledge: KnowledgeService,
     private readonly products: ProductsService,
   ) {
-    this.ai = new GoogleGenAI({ apiKey: config.getOrThrow<string>('GEMINI_API_KEY') });
+    this.ai = new OpenAI({ apiKey: config.getOrThrow<string>('OPENAI_API_KEY') });
   }
 
   async handleMessageStream(dto: SendMessageDto, onEvent: (e: ChatStreamEvent) => void): Promise<void> {
     const sessionId = dto.sessionId ?? (await this.createSession(dto.entryPoint));
     onEvent({ type: 'session', sessionId });
 
-    await this.saveMessage(sessionId, 'user', dto.message);
+    const messageText = dto.message?.trim() || (dto.imageUrl ? '(customer attached a photo, no additional text)' : '');
+    await this.saveMessage(sessionId, 'user', messageText, dto.imageUrl);
 
     const history = await this.getHistory(sessionId);
     const conversationText = [dto.productCode, ...history.map((m) => m.content)].filter(Boolean).join('\n');
@@ -79,6 +81,22 @@ export class ChatService {
 
     const systemPrompt = buildSystemPrompt(canRecommend);
 
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+      { role: 'system', content: `${systemPrompt}\n\nContext:\n${context}` },
+      ...history.map((m): OpenAI.Chat.ChatCompletionMessageParam => {
+        const role = m.role === 'assistant' ? 'assistant' : 'user';
+        if (!m.image_url) return { role, content: m.content };
+        // OpenAI accepts a plain image URL directly — no need to fetch/base64 it ourselves.
+        return {
+          role: 'user',
+          content: [
+            { type: 'text', text: m.content },
+            { type: 'image_url', image_url: { url: m.image_url } },
+          ],
+        };
+      }),
+    ];
+
     // Buffer until we know whether the reply starts with the NO_ANSWER marker, so we
     // never flash raw "NO_ANSWER: ..." text at the visitor before falling back.
     let full = '';
@@ -92,21 +110,15 @@ export class ChatService {
       determined = false;
 
       try {
-        const stream = await this.ai.models.generateContentStream({
+        const stream = await this.ai.chat.completions.create({
           model: MODEL,
-          contents: history.map((m) => ({
-            role: m.role === 'assistant' ? 'model' : 'user',
-            parts: [{ text: m.content }],
-          })),
-          config: {
-            systemInstruction: `${systemPrompt}\n\nContext:\n${context}`,
-            maxOutputTokens: 1024,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-          },
+          messages,
+          max_completion_tokens: 1024,
+          stream: true,
         });
 
         for await (const chunk of stream) {
-          const delta = chunk.text ?? '';
+          const delta = chunk.choices[0]?.delta?.content ?? '';
           if (!delta) continue;
           full += delta;
 
@@ -128,9 +140,8 @@ export class ChatService {
         }
         break; // this attempt completed successfully
       } catch (err) {
-        // Gemini overload/rate-limit errors are usually transient ("spikes in demand are
-        // usually temporary" per Google's own message) — silently retry once or twice,
-        // but only while nothing has reached the visitor yet for this turn.
+        // Overload/rate-limit errors are usually transient — silently retry once or
+        // twice, but only while nothing has reached the visitor yet for this turn.
         const { code } = classifyError(err);
         const isTransient = code === 'UPSTREAM_ERROR' || code === 'RATE_LIMIT';
         if (!chunkEmitted && isTransient && attempt < MAX_ATTEMPTS) {
@@ -184,21 +195,21 @@ export class ChatService {
     return data.id;
   }
 
-  private async saveMessage(sessionId: string, role: 'user' | 'assistant', content: string) {
+  private async saveMessage(sessionId: string, role: 'user' | 'assistant', content: string, imageUrl?: string) {
     const { error } = await this.supabase.client
       .from('chat_messages')
-      .insert({ session_id: sessionId, role, content });
+      .insert({ session_id: sessionId, role, content, image_url: imageUrl ?? null });
     if (error) throw error;
   }
 
   private async getHistory(sessionId: string) {
     const { data, error } = await this.supabase.client
       .from('chat_messages')
-      .select('role, content')
+      .select('role, content, image_url')
       .eq('session_id', sessionId)
       .order('created_at', { ascending: true });
     if (error) throw error;
-    return data as { role: 'user' | 'assistant' | 'system'; content: string }[];
+    return data as { role: 'user' | 'assistant' | 'system'; content: string; image_url: string | null }[];
   }
 
   async getTranscript(sessionId: string) {

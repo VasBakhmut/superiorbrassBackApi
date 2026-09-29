@@ -1,7 +1,19 @@
-import { Body, Controller, Get, HttpException, HttpStatus, Post, Res } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpException,
+  HttpStatus,
+  Post,
+  Res,
+  UploadedFile,
+  UseInterceptors,
+} from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import type { Response } from 'express';
 import { ChatService } from './chat.service.js';
 import { EscalationService } from '../escalation/escalation.service.js';
+import { ImageUploadService } from './image-upload.service.js';
 import { SendMessageDto } from './dto/send-message.dto.js';
 import { EscalateDto } from './dto/escalate.dto.js';
 import { classifyError } from './chat-error.util.js';
@@ -11,6 +23,7 @@ export class ChatController {
   constructor(
     private readonly chat: ChatService,
     private readonly escalation: EscalationService,
+    private readonly imageUpload: ImageUploadService,
   ) {}
 
   @Post('message')
@@ -30,6 +43,19 @@ export class ChatController {
       res.write(`data: ${JSON.stringify({ type: 'error', code, message })}\n\n`);
     } finally {
       res.end();
+    }
+  }
+
+  @Post('upload-image')
+  @UseInterceptors(FileInterceptor('file'))
+  async uploadImage(@UploadedFile() file: Express.Multer.File) {
+    if (!file) throw new HttpException('No file provided', HttpStatus.BAD_REQUEST);
+    try {
+      return await this.imageUpload.upload(file);
+    } catch (err) {
+      if (err instanceof HttpException) throw err;
+      const { code, message } = classifyError(err);
+      throw new HttpException({ code, message }, HttpStatus.SERVICE_UNAVAILABLE);
     }
   }
 

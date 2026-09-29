@@ -11,9 +11,9 @@ pnpm build
 pnpm start:prod   # runs dist/main.js
 ```
 
-Confirmed working: chat streaming, product list, escalation, CORS (multi-origin), classified
-error codes (invalid key, rate limit) — all tested end-to-end against this exact standalone
-build.
+Confirmed working: chat streaming, product recommendations, image upload + vision recognition,
+escalation, CORS (multi-origin), classified error codes (invalid key, rate limit) — all tested
+end-to-end against this exact standalone build.
 
 ## Where to host it
 
@@ -41,7 +41,7 @@ Set these in Railway → your service → Variables (same as `.env`):
 |---|---|
 | `SUPABASE_URL` | `https://plwhvqtcvdacmlnpiife.supabase.co` |
 | `SUPABASE_SERVICE_ROLE_KEY` | from Supabase dashboard → this project → Settings → API Keys |
-| `GEMINI_API_KEY` | |
+| `OPENAI_API_KEY` | used for chat generation and image/vision recognition (`gpt-4o-mini`) |
 | `RESEND_API_KEY` | optional — without it, escalations save to the DB but no email sends |
 | `ESCALATION_FROM_EMAIL` | only matters if `RESEND_API_KEY` is set |
 | `ESCALATION_TO_EMAIL` | same |
