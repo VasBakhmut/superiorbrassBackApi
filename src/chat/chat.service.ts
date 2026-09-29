@@ -48,6 +48,13 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Pure smalltalk/greetings ("hi", "how are you") get a canned reply with no AI call at
+// all — cheaper, instant, and sidesteps the model occasionally treating a bare "hi" as an
+// unanswerable question and escalating it.
+const GREETING_PATTERN =
+  /^(hi+|hello+|hey+|hiya|howdy|yo|g'?day|good\s?(morning|afternoon|evening)|how'?s?\s?(it\s?goin['g]?|things?)|how\s?(are|r)\s?(you|u|ya)|what'?s\s?up|sup)[\s!?.,]*$/i;
+const GREETING_REPLY = "Hi there! What can I help you with today?";
+
 @Injectable()
 export class ChatService {
   private readonly ai: OpenAI;
@@ -68,6 +75,13 @@ export class ChatService {
     const messageText = dto.message?.trim() || (dto.imageUrl ? '(customer attached a photo, no additional text)' : '');
     await this.saveMessage(sessionId, 'user', messageText, dto.imageUrl);
 
+    if (!dto.imageUrl && GREETING_PATTERN.test(messageText)) {
+      await this.saveMessage(sessionId, 'assistant', GREETING_REPLY);
+      onEvent({ type: 'chunk', text: GREETING_REPLY });
+      onEvent({ type: 'done', needsEscalation: false });
+      return;
+    }
+
     const history = await this.getHistory(sessionId);
     const conversationText = [dto.productCode, ...history.map((m) => m.content)].filter(Boolean).join('\n');
     const troubleshootingContext = await this.knowledge.getContextForConversation(conversationText);
@@ -75,7 +89,15 @@ export class ChatService {
     const canRecommend = RECOMMEND_CAPABLE_ENTRY_POINTS.has(dto.entryPoint ?? '');
     let context = troubleshootingContext;
     if (canRecommend) {
-      const products = await this.products.search(conversationText);
+      // Only the customer's own words, most recent first — the bot's own prior replies
+      // ("could you tell me more about...") are full of generic filler that was crowding
+      // out what the customer actually said once there'd been a few turns.
+      const userText = history
+        .filter((m) => m.role === 'user')
+        .map((m) => m.content)
+        .reverse()
+        .join('\n');
+      const products = await this.products.search(userText);
       context += `\n\nProducts (catalog snapshot — no live price/stock):\n${this.products.formatForPrompt(products)}`;
     }
 
