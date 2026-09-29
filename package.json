@@ -22,6 +22,7 @@
     "test:debug": "vitest --inspect-brk --no-file-parallelism",
     "test:e2e": "vitest run --config ./vitest.config.e2e.ts",
     "ingest": "tsx src/ingest/ingest.ts",
+    "ingest-products": "tsx src/ingest/ingest-products.ts",
     "scrape-download": "tsx src/ingest/scrape-download.ts"
   },
   "dependencies": {

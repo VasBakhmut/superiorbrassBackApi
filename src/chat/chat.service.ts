@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { SupabaseService } from '../supabase/supabase.service.js';
 import { KnowledgeService } from '../knowledge/knowledge.service.js';
+import { ProductsService } from '../knowledge/products.service.js';
 import { SendMessageDto } from './dto/send-message.dto.js';
 import { classifyError } from './chat-error.util.js';
 
@@ -11,16 +12,29 @@ const NO_ANSWER_MARKER = 'NO_ANSWER';
 const NO_ANSWER_FALLBACK_MESSAGE =
   "Sorry, I don't have a confident answer for that from our documentation. Could you share your email and product model so I can pass this to our support team?";
 
-const SYSTEM_PROMPT = `You are the technical support assistant for Austyle Architectural Hardware, an Australian door hardware manufacturer (digital locks, handles).
+// sticky widget + product page can recommend/suggest products; the header "technical
+// support" page stays strictly troubleshooting-only, per how the business wants each
+// entry point to behave.
+const RECOMMEND_CAPABLE_ENTRY_POINTS = new Set(['sticky_widget', 'product_page']);
+
+function buildSystemPrompt(canRecommend: boolean): string {
+  const base = `You are a helpful technical support and product assistant for an Australian architectural door hardware business (digital locks, handles, hinges and other door/window hardware). Speak naturally, like a helpful person, not a corporate script.
 
 Rules:
-- Answer ONLY using the "Context" provided below. It comes from Austyle's own SOPs, installation manuals and product brochures.
-- Never guess, and never use general knowledge about locks that isn't in the context.
+- Answer ONLY using the "Context" provided below (SOPs, installation manuals, troubleshooting guides, and, when relevant, a product catalog snapshot). Never guess, and never use general knowledge about hardware that isn't in the context.
 - Keep answers short, practical, step-by-step where relevant.
-- The context you're given is scoped to the product model mentioned in this conversation, and is built BEFORE you see the question — so if no model has been mentioned yet, model-specific documentation (e.g. troubleshooting for a specific fault) may simply be missing from your context even though it exists in our systems. So: for any troubleshooting or installation question, if the customer hasn't stated their product code/model anywhere in this conversation, your ENTIRE response must be one short question asking which model they have (e.g. "Which product/model is this — you'll usually find a code like 59405 on the lock or its box"). Do this every time, regardless of what is or isn't in the context, and do NOT use NO_ANSWER for this case.
-- If the context does not contain enough information to answer confidently, respond with EXACTLY one line:
-${NO_ANSWER_MARKER}: <one sentence summarising what the customer is asking, for a human agent>
-  and nothing else.`;
+- The troubleshooting context you're given is scoped to the product model mentioned in this conversation, and is built BEFORE you see the question — so if no model has been mentioned yet, model-specific documentation (e.g. troubleshooting for a specific fault) may simply be missing from your context even though it exists in our systems.`;
+
+  const codeRule = canRecommend
+    ? `- If the customer already owns a product and is troubleshooting an issue with it, and hasn't stated their product code/model anywhere in this conversation, ask which model they have before giving troubleshooting steps. Do NOT ask for a product code when the customer is instead asking you to help them choose/recommend a product they don't own yet — that's a normal, code-free request.`
+    : `- For any troubleshooting or installation question, if the customer hasn't stated their product code/model anywhere in this conversation, your ENTIRE response must be one short question asking which model they have (e.g. "Which product/model is this — you'll usually find a code like 59405 on the lock or its box"). Do this every time, and do NOT use NO_ANSWER for this case.`;
+
+  const recommendRule = canRecommend
+    ? `- You can recommend products from the "Products" section below when the customer is choosing between options or describing what they need (e.g. a lock for a security door). If nothing in that section looks like a genuinely good fit, say so honestly instead of forcing a recommendation. The product catalog is a snapshot with no live pricing or stock — never state a price, and only describe stock as "showed as in stock in our last catalog update," pointing the customer to confirm before buying.`
+    : `- This channel is for troubleshooting and product problems only — don't recommend or upsell other products here, focus on resolving the issue the customer already has.`;
+
+  return `${base}\n${codeRule}\n${recommendRule}\n- If the context does not contain enough information to answer confidently, respond with EXACTLY one line:\n${NO_ANSWER_MARKER}: <one sentence summarising what the customer is asking, for a human agent>\n  and nothing else.`;
+}
 
 export type ChatStreamEvent =
   | { type: 'session'; sessionId: string }
@@ -41,6 +55,7 @@ export class ChatService {
     config: ConfigService,
     private readonly supabase: SupabaseService,
     private readonly knowledge: KnowledgeService,
+    private readonly products: ProductsService,
   ) {
     this.ai = new GoogleGenAI({ apiKey: config.getOrThrow<string>('GEMINI_API_KEY') });
   }
@@ -53,7 +68,16 @@ export class ChatService {
 
     const history = await this.getHistory(sessionId);
     const conversationText = [dto.productCode, ...history.map((m) => m.content)].filter(Boolean).join('\n');
-    const context = await this.knowledge.getContextForConversation(conversationText);
+    const troubleshootingContext = await this.knowledge.getContextForConversation(conversationText);
+
+    const canRecommend = RECOMMEND_CAPABLE_ENTRY_POINTS.has(dto.entryPoint ?? '');
+    let context = troubleshootingContext;
+    if (canRecommend) {
+      const products = await this.products.search(conversationText);
+      context += `\n\nProducts (catalog snapshot — no live price/stock):\n${this.products.formatForPrompt(products)}`;
+    }
+
+    const systemPrompt = buildSystemPrompt(canRecommend);
 
     // Buffer until we know whether the reply starts with the NO_ANSWER marker, so we
     // never flash raw "NO_ANSWER: ..." text at the visitor before falling back.
@@ -75,7 +99,7 @@ export class ChatService {
             parts: [{ text: m.content }],
           })),
           config: {
-            systemInstruction: `${SYSTEM_PROMPT}\n\nContext:\n${context}`,
+            systemInstruction: `${systemPrompt}\n\nContext:\n${context}`,
             maxOutputTokens: 1024,
             thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
           },

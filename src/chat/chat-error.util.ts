@@ -44,6 +44,15 @@ export function classifyError(err: unknown): ClassifiedError {
       message: "Our AI provider is having issues right now — please try again shortly.",
     };
   }
+  // The SDK's own stream parser throws this (no HTTP status attached) when the connection
+  // to Gemini gets cut off mid-response — observed in practice to be transient, same as the
+  // other overload symptoms above.
+  if (text.includes('Incomplete JSON segment')) {
+    return {
+      code: 'UPSTREAM_ERROR',
+      message: "Our AI provider is having issues right now — please try again shortly.",
+    };
+  }
   return {
     code: 'UNKNOWN',
     message: 'Something went wrong on our end. Please try again.',
