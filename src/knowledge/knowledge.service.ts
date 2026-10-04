@@ -12,32 +12,34 @@ export class KnowledgeService {
   constructor(private readonly supabase: SupabaseService) {}
 
   /**
-   * Builds chat context scoped to the product model(s) mentioned in the conversation so far.
-   * No extra LLM call needed: product codes are already tagged on each document (from the
-   * source filename), so we just check whether any known code appears as a whole word in
-   * the conversation text, and only include docs for that code plus the general ones
-   * (docs with no product code, e.g. the troubleshooting brochure).
+   * Builds chat context scoped ONLY to the product model(s) actually mentioned in the
+   * conversation — no "general" fallback bucket. If no code is mentioned yet, this returns
+   * nothing and costs nothing: the system prompt already makes the model ask which model the
+   * customer has before it needs any document content, so there's nothing useful to send.
+   *
+   * Two DB round-trips on purpose: the first fetches only `product_codes` (cheap) to figure
+   * out which docs are even relevant, and the second fetches `full_text` for just those rows
+   * — we never pull text for a document the conversation didn't ask about.
    */
   async getContextForConversation(conversationText: string): Promise<string> {
+    const { data: codeRows, error: codeError } = await this.supabase.client
+      .from('documents')
+      .select('product_codes')
+      .eq('include_in_chat_context', true);
+    if (codeError) throw codeError;
+
+    const knownCodes = new Set((codeRows ?? []).flatMap((d) => d.product_codes ?? []));
+    const mentionedCodes = [...knownCodes].filter((code) => new RegExp(`\\b${code}\\b`).test(conversationText));
+    if (mentionedCodes.length === 0) return '';
+
     const { data, error } = await this.supabase.client
       .from('documents')
       .select('title, full_text, product_codes')
-      .eq('include_in_chat_context', true);
+      .eq('include_in_chat_context', true)
+      .overlaps('product_codes', mentionedCodes);
     if (error) throw error;
 
-    const docs = (data ?? []) as DocRow[];
-
-    const knownCodes = new Set(docs.flatMap((d) => d.product_codes ?? []));
-    const mentionedCodes = [...knownCodes].filter((code) =>
-      new RegExp(`\\b${code}\\b`).test(conversationText),
-    );
-
-    const relevant = docs.filter((d) => {
-      const codes = d.product_codes ?? [];
-      return codes.length === 0 || codes.some((c) => mentionedCodes.includes(c));
-    });
-
-    return relevant
+    return (data as DocRow[] ?? [])
       .filter((d) => d.full_text)
       .map((d) => `### ${d.title}\n${d.full_text}`)
       .join('\n\n---\n\n');

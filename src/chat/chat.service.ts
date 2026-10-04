@@ -4,6 +4,7 @@ import OpenAI from 'openai';
 import { SupabaseService } from '../supabase/supabase.service.js';
 import { KnowledgeService } from '../knowledge/knowledge.service.js';
 import { ProductsService } from '../knowledge/products.service.js';
+import { DrawingsService } from '../knowledge/drawings.service.js';
 import { SendMessageDto } from './dto/send-message.dto.js';
 import { classifyError } from './chat-error.util.js';
 
@@ -24,14 +25,16 @@ Rules:
 - Answer ONLY using the "Context" provided below (SOPs, installation manuals, troubleshooting guides, and, when relevant, a product catalog snapshot). Never guess, and never use general knowledge about hardware that isn't in the context.
 - Keep answers short, practical, step-by-step where relevant.
 - The customer may attach a photo (of their existing hardware, or of their door). Look at it and use what you can actually see — the product type, finish, visible damage, mounting details — to inform your answer. If you can identify a product code or close match from the image, say so, but don't invent a code you can't actually read or infer with reasonable confidence.
-- The troubleshooting context you're given is scoped to the product model mentioned in this conversation, and is built BEFORE you see the question — so if no model has been mentioned yet, model-specific documentation (e.g. troubleshooting for a specific fault) may simply be missing from your context even though it exists in our systems.`;
+- The troubleshooting context you're given is scoped to the product model mentioned in this conversation, and is built BEFORE you see the question — so if no model has been mentioned yet, model-specific documentation (e.g. troubleshooting for a specific fault) may simply be missing from your context even though it exists in our systems.
+- If the context includes a "Product drawings" section, that's a direct answer when the customer asks for a technical drawing, dimensions, template, or spec sheet for a specific code — give them that exact link. If they ask for a drawing but no matching code appears in that section, ask them for the exact product code first (drawings are looked up by exact code only, there's no "closest match").`;
 
   const codeRule = canRecommend
     ? `- If the customer already owns a product and is troubleshooting an issue with it, and hasn't stated their product code/model anywhere in this conversation, ask which model they have before giving troubleshooting steps. Do NOT ask for a product code when the customer is instead asking you to help them choose/recommend a product they don't own yet — that's a normal, code-free request.`
     : `- For any troubleshooting or installation question, if the customer hasn't stated their product code/model anywhere in this conversation, your ENTIRE response must be one short question asking which model they have (e.g. "Which product/model is this — you'll usually find a code like 59405 on the lock or its box"). Do this every time, and do NOT use NO_ANSWER for this case.`;
 
   const recommendRule = canRecommend
-    ? `- You can recommend products from the "Products" section below when the customer is choosing between options or describing what they need (e.g. a lock for a security door). If nothing in that section looks like a genuinely good fit, say so honestly instead of forcing a recommendation. The product catalog is a snapshot with no live pricing or stock — never state a price, and only describe stock as "showed as in stock in our last catalog update," pointing the customer to confirm before buying.`
+    ? `- You can recommend products from the "Products" section below when the customer is choosing between options or describing what they need (e.g. a lock for a security door). If nothing in that section looks like a genuinely good fit, say so honestly instead of forcing a recommendation. The product catalog is a snapshot with no live pricing or stock — never state a price, and only describe stock as "showed as in stock in our last catalog update," pointing the customer to confirm before buying.
+- When a product entry in "Products" includes a "link", always give that exact link to the customer when you mention that product by name or code — never say you can't provide one. When it includes "used in conjunction with", that's the exact answer for compatibility/accessory questions (e.g. "what escutcheon do I need with X") — use it directly instead of guessing a code.`
     : `- This channel is for troubleshooting and product problems only — don't recommend or upsell other products here, focus on resolving the issue the customer already has.`;
 
   return `${base}\n${codeRule}\n${recommendRule}\n- If the context does not contain enough information to answer confidently, respond with EXACTLY one line:\n${NO_ANSWER_MARKER}: <one sentence summarising what the customer is asking, for a human agent>\n  and nothing else.`;
@@ -64,6 +67,7 @@ export class ChatService {
     private readonly supabase: SupabaseService,
     private readonly knowledge: KnowledgeService,
     private readonly products: ProductsService,
+    private readonly drawings: DrawingsService,
   ) {
     this.ai = new OpenAI({ apiKey: config.getOrThrow<string>('OPENAI_API_KEY') });
   }
@@ -86,28 +90,44 @@ export class ChatService {
     const conversationText = [dto.productCode, ...history.map((m) => m.content)].filter(Boolean).join('\n');
     const troubleshootingContext = await this.knowledge.getContextForConversation(conversationText);
 
-    const canRecommend = RECOMMEND_CAPABLE_ENTRY_POINTS.has(dto.entryPoint ?? '');
+    // Only the customer's own words (plus a known product code from the page), most recent
+    // first — the bot's own prior replies ("could you tell me more about...") are full of
+    // generic filler that crowds out what the customer actually said once there'd been a
+    // few turns, and were previously drowning out real product codes in the keyword search.
+    const userText = [dto.productCode, ...history.filter((m) => m.role === 'user').map((m) => m.content)]
+      .filter(Boolean)
+      .reverse()
+      .join('\n');
+
     let context = troubleshootingContext;
+
+    // Drawings are exact-code-only (see DrawingsService) and available on every entry point —
+    // a request for a technical drawing isn't a "recommendation," so this isn't gated by
+    // canRecommend. This never fires (and never hits the DB) unless a code-shaped token is
+    // actually present in what the customer wrote.
+    const drawings = await this.drawings.search(userText);
+    if (drawings.length > 0) {
+      context += `\n\nProduct drawings:\n${this.drawings.formatForPrompt(drawings)}`;
+    }
+
+    const canRecommend = RECOMMEND_CAPABLE_ENTRY_POINTS.has(dto.entryPoint ?? '');
     if (canRecommend) {
-      // Only the customer's own words, most recent first — the bot's own prior replies
-      // ("could you tell me more about...") are full of generic filler that was crowding
-      // out what the customer actually said once there'd been a few turns.
-      const userText = history
-        .filter((m) => m.role === 'user')
-        .map((m) => m.content)
-        .reverse()
-        .join('\n');
       const products = await this.products.search(userText);
       context += `\n\nProducts (catalog snapshot — no live price/stock):\n${this.products.formatForPrompt(products)}`;
     }
 
     const systemPrompt = buildSystemPrompt(canRecommend);
 
+    const lastIndex = history.length - 1;
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
       { role: 'system', content: `${systemPrompt}\n\nContext:\n${context}` },
-      ...history.map((m): OpenAI.Chat.ChatCompletionMessageParam => {
+      ...history.map((m, i): OpenAI.Chat.ChatCompletionMessageParam => {
         const role = m.role === 'assistant' ? 'assistant' : 'user';
-        if (!m.image_url) return { role, content: m.content };
+        // Only re-attach the image on the turn it was actually uploaded (the last message
+        // in history, since this is the current turn) — re-sending it on every later turn
+        // would re-run (and re-bill) vision analysis on the same photo once per message for
+        // the rest of the conversation. The model's own reply to it is the lasting record.
+        if (!m.image_url || i !== lastIndex) return { role, content: m.content };
         // OpenAI accepts a plain image URL directly — no need to fetch/base64 it ourselves.
         return {
           role: 'user',

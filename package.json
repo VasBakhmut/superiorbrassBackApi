@@ -23,6 +23,8 @@
     "test:e2e": "vitest run --config ./vitest.config.e2e.ts",
     "ingest": "tsx src/ingest/ingest.ts",
     "ingest-products": "tsx src/ingest/ingest-products.ts",
+    "ingest-product-drawings": "tsx src/ingest/ingest-product-drawings.ts",
+    "scrape-catalog": "tsx src/ingest/scrape-catalog.ts",
     "scrape-download": "tsx src/ingest/scrape-download.ts"
   },
   "dependencies": {
