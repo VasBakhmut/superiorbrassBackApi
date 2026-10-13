@@ -25,6 +25,9 @@
     "ingest-products": "tsx src/ingest/ingest-products.ts",
     "ingest-product-drawings": "tsx src/ingest/ingest-product-drawings.ts",
     "scrape-catalog": "tsx src/ingest/scrape-catalog.ts",
+    "import-item-info": "tsx src/ingest/import-item-info.ts",
+    "import-daniel-docs": "tsx src/ingest/import-daniel-docs.ts",
+    "golden": "tsx src/qa/golden.ts",
     "scrape-download": "tsx src/ingest/scrape-download.ts"
   },
   "dependencies": {

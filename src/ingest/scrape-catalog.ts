@@ -243,7 +243,11 @@ interface Cache {
 
 function loadCache(): Cache {
   if (process.argv.includes('--fresh') || !fs.existsSync(CACHE_FILE)) return { products: {} };
-  return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+  const cache: Cache = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+  // a crawl state written by an older version of this script has a different shape; drop it
+  if (cache.crawl && !Array.isArray(cache.crawl.queue)) cache.crawl = undefined;
+  cache.products ??= {};
+  return cache;
 }
 
 function saveCache(cache: Cache) {

@@ -1,62 +1,65 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import OpenAI from 'openai';
+import type { LinkItem, ProductCard } from '../catalog/catalog.types.js';
 import { SupabaseService } from '../supabase/supabase.service.js';
-import { KnowledgeService } from '../knowledge/knowledge.service.js';
-import { ProductsService } from '../knowledge/products.service.js';
-import { DrawingsService } from '../knowledge/drawings.service.js';
-import { SendMessageDto } from './dto/send-message.dto.js';
 import { classifyError } from './chat-error.util.js';
+import { SendMessageDto } from './dto/send-message.dto.js';
+import { renderText } from './render.js';
+import { type AiContext, AnswerRouter, type RoutedAnswer } from './router.service.js';
+import { T } from './templates.js';
 
 const MODEL = 'gpt-4o-mini';
 const NO_ANSWER_MARKER = 'NO_ANSWER';
-const NO_ANSWER_FALLBACK_MESSAGE =
-  "Sorry, I don't have a confident answer for that from our documentation. Could you share your email and product model so I can pass this to our support team?";
+const MAX_ATTEMPTS = 3;
 
-// sticky widget + product page can recommend/suggest products; the header "technical
-// support" page stays strictly troubleshooting-only, per how the business wants each
-// entry point to behave.
-const RECOMMEND_CAPABLE_ENTRY_POINTS = new Set(['sticky_widget', 'product_page']);
-
+/**
+ * Prompt for the part of the conversation the backend could not answer by rules. The model may
+ * use general knowledge to understand the customer ("marine grade" = 316 stainless) but every
+ * fact about our products has to come from the Context.
+ */
 function buildSystemPrompt(canRecommend: boolean): string {
-  const base = `You are a helpful technical support and product assistant for an Australian architectural door hardware business (digital locks, handles, hinges and other door/window hardware). Speak naturally, like a helpful person, not a corporate script.
+  return `You are a friendly, knowledgeable support assistant for an Australian architectural door hardware business (Austyle, Superior Brass and Builders Choice: digital locks, handles, hinges and other door and window hardware). Speak naturally and keep answers short and practical, step by step where that helps.
 
-Rules:
-- Answer ONLY using the "Context" provided below (SOPs, installation manuals, troubleshooting guides, and, when relevant, a product catalog snapshot). Never guess, and never use general knowledge about hardware that isn't in the context.
-- Keep answers short, practical, step-by-step where relevant.
-- The customer may attach a photo (of their existing hardware, or of their door). Look at it and use what you can actually see — the product type, finish, visible damage, mounting details — to inform your answer. If you can identify a product code or close match from the image, say so, but don't invent a code you can't actually read or infer with reasonable confidence.
-- The troubleshooting context you're given is scoped to the product model mentioned in this conversation, and is built BEFORE you see the question — so if no model has been mentioned yet, model-specific documentation (e.g. troubleshooting for a specific fault) may simply be missing from your context even though it exists in our systems.
-- If the context includes a "Product drawings" section, that's a direct answer when the customer asks for a technical drawing, dimensions, template, or spec sheet for a specific code — give them that exact link. If they ask for a drawing but no matching code appears in that section, ask them for the exact product code first (drawings are looked up by exact code only, there's no "closest match").`;
-
-  const codeRule = canRecommend
-    ? `- If the customer already owns a product and is troubleshooting an issue with it, and hasn't stated their product code/model anywhere in this conversation, ask which model they have before giving troubleshooting steps. Do NOT ask for a product code when the customer is instead asking you to help them choose/recommend a product they don't own yet — that's a normal, code-free request.`
-    : `- For any troubleshooting or installation question, if the customer hasn't stated their product code/model anywhere in this conversation, your ENTIRE response must be one short question asking which model they have (e.g. "Which product/model is this — you'll usually find a code like 59405 on the lock or its box"). Do this every time, and do NOT use NO_ANSWER for this case.`;
-
-  const recommendRule = canRecommend
-    ? `- You can recommend products from the "Products" section below when the customer is choosing between options or describing what they need (e.g. a lock for a security door). If nothing in that section looks like a genuinely good fit, say so honestly instead of forcing a recommendation. The product catalog is a snapshot with no live pricing or stock — never state a price, and only describe stock as "showed as in stock in our last catalog update," pointing the customer to confirm before buying.
-- When a product entry in "Products" includes a "link", always give that exact link to the customer when you mention that product by name or code — never say you can't provide one. When it includes "used in conjunction with", that's the exact answer for compatibility/accessory questions (e.g. "what escutcheon do I need with X") — use it directly instead of guessing a code.`
-    : `- This channel is for troubleshooting and product problems only — don't recommend or upsell other products here, focus on resolving the issue the customer already has.`;
-
-  return `${base}\n${codeRule}\n${recommendRule}\n- If the context does not contain enough information to answer confidently, respond with EXACTLY one line:\n${NO_ANSWER_MARKER}: <one sentence summarising what the customer is asking, for a human agent>\n  and nothing else.`;
+How to use what you know:
+- You may use your general knowledge of door hardware to understand what the customer means or to explain something simply (for example that "marine grade" stainless steel means 316).
+- Every fact about OUR products (codes, links, compatibility, finishes, instructions) must come from the "Context" below. Never invent a product code, a link or a specification, and never state a price.
+- Give links exactly as they appear in the Context, as markdown links.
+- Stock changes by the hour and the system checks it live whenever the customer gives a product code, so never state availability yourself. If they ask about stock without a code, ask for the product code.
+- The customer may attach a photo of their hardware or door. Use what you can actually see (product type, finish, visible damage, mounting) and, if you can identify a product code or close match, say so, but never invent a code you cannot read or infer with reasonable confidence.
+- For troubleshooting, work from the documents in the Context. If the documents don't cover the problem, say so plainly instead of guessing.
+${canRecommend ? '- You may suggest products that appear in the Context.' : '- This channel is for technical support only: do not recommend or upsell products.'}
+- If you cannot help properly from the Context, reply with EXACTLY one line:
+${NO_ANSWER_MARKER}: <one sentence summarising what the customer is asking, for a human agent>
+  and nothing else. Never tell the customer to "check with your supplier".`;
 }
 
 export type ChatStreamEvent =
   | { type: 'session'; sessionId: string }
   | { type: 'chunk'; text: string }
-  | { type: 'done'; needsEscalation: boolean; escalationSummary?: string; message?: string };
-
-const MAX_ATTEMPTS = 3;
+  | { type: 'cards'; items: ProductCard[] }
+  | { type: 'links'; items: LinkItem[] }
+  | {
+      type: 'done';
+      needsEscalation: boolean;
+      escalationSummary?: string;
+      message?: string;
+      /** who produced the reply: our own rules or the AI */
+      source?: 'rules' | 'ai';
+      intent?: string;
+    };
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Pure smalltalk/greetings ("hi", "how are you") get a canned reply with no AI call at
-// all — cheaper, instant, and sidesteps the model occasionally treating a bare "hi" as an
-// unanswerable question and escalating it.
-const GREETING_PATTERN =
-  /^(hi+|hello+|hey+|hiya|howdy|yo|g'?day|good\s?(morning|afternoon|evening)|how'?s?\s?(it\s?goin['g]?|things?)|how\s?(are|r)\s?(you|u|ya)|what'?s\s?up|sup)[\s!?.,]*$/i;
-const GREETING_REPLY = "Hi there! What can I help you with today?";
+interface MessageMeta {
+  source: 'rules' | 'ai';
+  intent: string;
+  cards?: ProductCard[];
+  links?: LinkItem[];
+  escalation?: { summary: string };
+}
 
 @Injectable()
 export class ChatService {
@@ -65,9 +68,7 @@ export class ChatService {
   constructor(
     config: ConfigService,
     private readonly supabase: SupabaseService,
-    private readonly knowledge: KnowledgeService,
-    private readonly products: ProductsService,
-    private readonly drawings: DrawingsService,
+    private readonly router: AnswerRouter,
   ) {
     this.ai = new OpenAI({ apiKey: config.getOrThrow<string>('OPENAI_API_KEY') });
   }
@@ -79,56 +80,68 @@ export class ChatService {
     const messageText = dto.message?.trim() || (dto.imageUrl ? '(customer attached a photo, no additional text)' : '');
     await this.saveMessage(sessionId, 'user', messageText, dto.imageUrl);
 
-    if (!dto.imageUrl && GREETING_PATTERN.test(messageText)) {
-      await this.saveMessage(sessionId, 'assistant', GREETING_REPLY);
-      onEvent({ type: 'chunk', text: GREETING_REPLY });
-      onEvent({ type: 'done', needsEscalation: false });
+    const history = await this.getHistory(sessionId);
+    const userHistory = history.filter((m) => m.role === 'user').map((m) => m.content).slice(0, -1);
+
+    const outcome = await this.router.route({
+      text: messageText,
+      userHistory,
+      entryPoint: dto.entryPoint,
+      productCode: dto.productCode,
+      hasImage: !!dto.imageUrl,
+      sessionId,
+    });
+
+    if (outcome.kind === 'answer') {
+      await this.sendAnswer(sessionId, outcome.answer, new Set(dto.clientFeatures ?? []), onEvent);
       return;
     }
 
-    const history = await this.getHistory(sessionId);
-    const conversationText = [dto.productCode, ...history.map((m) => m.content)].filter(Boolean).join('\n');
-    const troubleshootingContext = await this.knowledge.getContextForConversation(conversationText);
+    if (outcome.kind === 'escalate') {
+      await this.saveMessage(sessionId, 'assistant', outcome.message, undefined, {
+        source: 'rules',
+        intent: outcome.intent,
+        escalation: { summary: outcome.summary },
+      });
+      onEvent({ type: 'done', needsEscalation: true, escalationSummary: outcome.summary, message: outcome.message, source: 'rules', intent: outcome.intent });
+      return;
+    }
 
-    // Only the customer's own words (plus a known product code from the page), most recent
-    // first — the bot's own prior replies ("could you tell me more about...") are full of
-    // generic filler that crowds out what the customer actually said once there'd been a
-    // few turns, and were previously drowning out real product codes in the keyword search.
-    const userText = [dto.productCode, ...history.filter((m) => m.role === 'user').map((m) => m.content)]
+    await this.answerWithAi(sessionId, history, outcome.context, onEvent);
+  }
+
+  private async sendAnswer(sessionId: string, a: RoutedAnswer, features: Set<string>, onEvent: (e: ChatStreamEvent) => void) {
+    const supports = { cards: features.has('cards'), links: features.has('links') };
+    const text = renderText(a, supports);
+    await this.saveMessage(sessionId, 'assistant', text, undefined, { source: 'rules', intent: a.intent, cards: a.cards, links: a.links });
+    onEvent({ type: 'chunk', text });
+    if (supports.cards && a.cards?.length) onEvent({ type: 'cards', items: a.cards });
+    if (supports.links && a.links?.length) onEvent({ type: 'links', items: a.links });
+    onEvent({ type: 'done', needsEscalation: false, source: 'rules', intent: a.intent });
+  }
+
+  private async answerWithAi(
+    sessionId: string,
+    history: { role: 'user' | 'assistant' | 'system'; content: string; image_url: string | null }[],
+    ctx: AiContext,
+    onEvent: (e: ChatStreamEvent) => void,
+  ) {
+    const context = [
+      ctx.productFacts && `Products the customer is asking about:\n${ctx.productFacts}`,
+      ctx.docsText && `Documents:\n${ctx.docsText}`,
+    ]
       .filter(Boolean)
-      .reverse()
-      .join('\n');
-
-    let context = troubleshootingContext;
-
-    // Drawings are exact-code-only (see DrawingsService) and available on every entry point —
-    // a request for a technical drawing isn't a "recommendation," so this isn't gated by
-    // canRecommend. This never fires (and never hits the DB) unless a code-shaped token is
-    // actually present in what the customer wrote.
-    const drawings = await this.drawings.search(userText);
-    if (drawings.length > 0) {
-      context += `\n\nProduct drawings:\n${this.drawings.formatForPrompt(drawings)}`;
-    }
-
-    const canRecommend = RECOMMEND_CAPABLE_ENTRY_POINTS.has(dto.entryPoint ?? '');
-    if (canRecommend) {
-      const products = await this.products.search(userText);
-      context += `\n\nProducts (catalog snapshot — no live price/stock):\n${this.products.formatForPrompt(products)}`;
-    }
-
-    const systemPrompt = buildSystemPrompt(canRecommend);
+      .join('\n\n') || '(no product or document data matched this question)';
 
     const lastIndex = history.length - 1;
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-      { role: 'system', content: `${systemPrompt}\n\nContext:\n${context}` },
+      { role: 'system', content: `${buildSystemPrompt(ctx.canRecommend)}\n\nContext:\n${context}` },
       ...history.map((m, i): OpenAI.Chat.ChatCompletionMessageParam => {
         const role = m.role === 'assistant' ? 'assistant' : 'user';
-        // Only re-attach the image on the turn it was actually uploaded (the last message
-        // in history, since this is the current turn) — re-sending it on every later turn
-        // would re-run (and re-bill) vision analysis on the same photo once per message for
-        // the rest of the conversation. The model's own reply to it is the lasting record.
+        // Only re-attach the image on the turn it was actually uploaded (the last message in
+        // history): re-sending it on every later turn would re-run, and re-bill, vision analysis
+        // on the same photo for the rest of the conversation. The model's own reply is the record.
         if (!m.image_url || i !== lastIndex) return { role, content: m.content };
-        // OpenAI accepts a plain image URL directly — no need to fetch/base64 it ourselves.
         return {
           role: 'user',
           content: [
@@ -180,10 +193,10 @@ export class ChatService {
             chunkEmitted = true;
           }
         }
-        break; // this attempt completed successfully
+        break;
       } catch (err) {
-        // Overload/rate-limit errors are usually transient — silently retry once or
-        // twice, but only while nothing has reached the visitor yet for this turn.
+        // Overload/rate-limit errors are usually transient: retry, but only while nothing has
+        // reached the visitor yet for this turn.
         const { code } = classifyError(err);
         const isTransient = code === 'UPSTREAM_ERROR' || code === 'RATE_LIMIT';
         if (!chunkEmitted && isTransient && attempt < MAX_ATTEMPTS) {
@@ -200,19 +213,14 @@ export class ChatService {
     }
 
     const text = full.trim();
-    await this.saveMessage(sessionId, 'assistant', text);
-
     if (isNoAnswer) {
       const summary = text.slice(NO_ANSWER_MARKER.length).replace(/^:\s*/, '');
-      onEvent({
-        type: 'done',
-        needsEscalation: true,
-        escalationSummary: summary,
-        message: NO_ANSWER_FALLBACK_MESSAGE,
-      });
-    } else {
-      onEvent({ type: 'done', needsEscalation: false });
+      await this.saveMessage(sessionId, 'assistant', T.escalate, undefined, { source: 'ai', intent: ctx.intent, escalation: { summary } });
+      onEvent({ type: 'done', needsEscalation: true, escalationSummary: summary, message: T.escalate, source: 'ai', intent: ctx.intent });
+      return;
     }
+    await this.saveMessage(sessionId, 'assistant', text, undefined, { source: 'ai', intent: ctx.intent });
+    onEvent({ type: 'done', needsEscalation: false, source: 'ai', intent: ctx.intent });
   }
 
   async listProductCodes(): Promise<string[]> {
@@ -237,10 +245,10 @@ export class ChatService {
     return data.id;
   }
 
-  private async saveMessage(sessionId: string, role: 'user' | 'assistant', content: string, imageUrl?: string) {
+  private async saveMessage(sessionId: string, role: 'user' | 'assistant', content: string, imageUrl?: string, meta?: MessageMeta) {
     const { error } = await this.supabase.client
       .from('chat_messages')
-      .insert({ session_id: sessionId, role, content, image_url: imageUrl ?? null });
+      .insert({ session_id: sessionId, role, content, image_url: imageUrl ?? null, meta: meta ?? null });
     if (error) throw error;
   }
 
